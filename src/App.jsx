@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
-import { loadData, semanticSearch } from './services/searchService'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { loadData, semanticSearch, getFilterOptions, formatStadtteil } from './services/searchService'
 import DetailModal from './components/DetailModal'
 import MapPanel from './components/MapPanel'
 import './App.css'
@@ -22,7 +22,62 @@ const MODE_ICONS = {
   DRIVING:   '🚗',
 }
 
+const EMPTY_FILTERS = { categories: [], stadtteile: [], targets: [] }
+const MAX_BROWSE = 50
+
+/* ── Filter-Akkordeon ──────────────────────────────────────────── */
+
+function FilterAccordion({ label, options, selected, onChange, displayFn }) {
+  const [open, setOpen] = useState(false)
+
+  const toggle = (value) => {
+    onChange(
+      selected.includes(value)
+        ? selected.filter(v => v !== value)
+        : [...selected, value]
+    )
+  }
+
+  return (
+    <div className="filter-group">
+      <button className="filter-header" type="button" onClick={() => setOpen(!open)}>
+        <span>
+          {label}
+          {selected.length > 0 && <span className="filter-count">{selected.length}</span>}
+        </span>
+        <span className={`filter-chevron${open ? ' open' : ''}`}>&#9662;</span>
+      </button>
+      {open && (
+        <div className="filter-options">
+          {options.map(opt => (
+            <label key={opt} className="filter-option">
+              <input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => toggle(opt)}
+              />
+              <span>{displayFn ? displayFn(opt) : opt}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ── Hilfsfunktion: Beschreibung für Browse-Modus ─────────────── */
+
+function getDesc(item) {
+  if (item.desc) return item.desc
+  if (!item.description) return ''
+  const text = item.description.replace(/<[^>]+>/g, '').trim()
+  return text.length > 180 ? text.slice(0, 177) + '…' : text
+}
+
+/* ── Ergebnis-Karte ────────────────────────────────────────────── */
+
 function ResultCard({ item, onOpen, travelTime, number }) {
+  const desc = getDesc(item)
   return (
     <article className="card" onClick={() => onOpen(item)} role="button" tabIndex={0}
       onKeyDown={(e) => e.key === 'Enter' && onOpen(item)}>
@@ -33,11 +88,13 @@ function ResultCard({ item, onOpen, travelTime, number }) {
       <h3 className="card-title">{item.name}</h3>
       {item.ort && <p className="card-location">{item.ort}</p>}
       {travelTime && <p className="card-travel">{travelTime}</p>}
-      {item.desc && <p className="card-desc">{item.desc}</p>}
+      {desc && <p className="card-desc">{desc}</p>}
       <span className="card-cta">Details ansehen →</span>
     </article>
   )
 }
+
+/* ── App ───────────────────────────────────────────────────────── */
 
 export default function App() {
   const [query, setQuery]         = useState('')
@@ -47,6 +104,8 @@ export default function App() {
   const [data, setData]           = useState(null)
   const [dataError, setDataError] = useState(null)
   const [selected, setSelected]   = useState(null)
+  const [stadtteil, setStadtteil] = useState(null)
+  const [filters, setFilters]     = useState(EMPTY_FILTERS)
   const [travelInfo, setTravelInfo] = useState({ mode: null, times: {} })
 
   useEffect(() => {
@@ -55,6 +114,35 @@ export default function App() {
       .catch(() => setDataError('Daten konnten nicht geladen werden.'))
   }, [])
 
+  const filterOptions = useMemo(() => data ? getFilterOptions(data) : null, [data])
+
+  const hasActiveFilters = filters.categories.length + filters.stadtteile.length + filters.targets.length > 0
+
+  // Angebote nach Filtern filtern
+  const applyFilters = useCallback((offers) => {
+    if (!hasActiveFilters) return offers
+    return offers.filter(offer => {
+      if (filters.categories.length > 0 && !(offer.categories || []).some(c => filters.categories.includes(c))) return false
+      if (filters.stadtteile.length > 0 && !(offer.stadtteile || []).some(s => filters.stadtteile.includes(s))) return false
+      if (filters.targets.length > 0 && !(offer.targets || []).some(t => filters.targets.includes(t))) return false
+      return true
+    })
+  }, [filters, hasActiveFilters])
+
+  // Angezeigte Ergebnisse: Suche + Filter kombiniert, oder nur Filter (Browse)
+  const displayedResults = useMemo(() => {
+    if (!data) return null
+    if (results !== null) return applyFilters(results)
+    if (hasActiveFilters) return applyFilters([...data.offersMap.values()]).slice(0, MAX_BROWSE)
+    return null
+  }, [data, results, applyFilters, hasActiveFilters])
+
+  const isBrowseMode = results === null && hasActiveFilters
+  const totalBrowseCount = useMemo(() => {
+    if (!isBrowseMode || !data) return 0
+    return applyFilters([...data.offersMap.values()]).length
+  }, [isBrowseMode, data, applyFilters])
+
   const runSearch = useCallback(
     async (q) => {
       if (!q.trim() || !data) return
@@ -62,8 +150,9 @@ export default function App() {
       setError(null)
       setResults(null)
       try {
-        const matches = await semanticSearch(q, data)
+        const { results: matches, stadtteil: st } = await semanticSearch(q, data)
         setResults(matches)
+        setStadtteil(st)
       } catch (err) {
         setError('Suche fehlgeschlagen: ' + err.message)
       } finally {
@@ -86,14 +175,20 @@ export default function App() {
   const handleReset = () => {
     setResults(null)
     setError(null)
+    setStadtteil(null)
     setQuery('')
+    setFilters(EMPTY_FILTERS)
+  }
+
+  const handleFilterChange = (key) => (values) => {
+    setFilters(prev => ({ ...prev, [key]: values }))
   }
 
   const handleTravelUpdate = useCallback((mode, times) => {
     setTravelInfo({ mode, times })
   }, [])
 
-  const showExamples = results === null && !loading && !error
+  const showExamples = displayedResults === null && !loading && !error
 
   return (
     <div className="app">
@@ -108,7 +203,7 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        {/* ── Linke Spalte: Suche + Ergebnisse ── */}
+        {/* ── Linke Spalte: Suche + Filter + Ergebnisse ── */}
         <div className="left-panel">
           <div className="left-inner">
 
@@ -133,6 +228,40 @@ export default function App() {
               </form>
               {dataError && <p className="msg-error">{dataError}</p>}
             </section>
+
+            {/* ── Filter ── */}
+            {filterOptions && (
+              <section className="filter-panel">
+                <FilterAccordion
+                  label="Einsatzbereiche"
+                  options={filterOptions.categories}
+                  selected={filters.categories}
+                  onChange={handleFilterChange('categories')}
+                />
+                <FilterAccordion
+                  label="Stadtteile"
+                  options={filterOptions.stadtteile}
+                  selected={filters.stadtteile}
+                  onChange={handleFilterChange('stadtteile')}
+                  displayFn={formatStadtteil}
+                />
+                <FilterAccordion
+                  label="Zielgruppen"
+                  options={filterOptions.targets}
+                  selected={filters.targets}
+                  onChange={handleFilterChange('targets')}
+                />
+                {hasActiveFilters && (
+                  <button
+                    className="filter-reset"
+                    type="button"
+                    onClick={() => setFilters(EMPTY_FILTERS)}
+                  >
+                    Filter zurücksetzen
+                  </button>
+                )}
+              </section>
+            )}
 
             {showExamples && (
               <section className="examples-section">
@@ -166,20 +295,23 @@ export default function App() {
               </div>
             )}
 
-            {results !== null && !loading && (
+            {displayedResults !== null && !loading && (
               <section className="results-section">
                 <div className="results-header">
                   <p className="results-count">
-                    {results.length === 0
+                    {displayedResults.length === 0
                       ? 'Keine passenden Angebote gefunden.'
-                      : `${results.length} Angebot${results.length !== 1 ? 'e' : ''} gefunden`}
+                      : isBrowseMode && totalBrowseCount > MAX_BROWSE
+                        ? `${MAX_BROWSE} von ${totalBrowseCount} Angeboten`
+                        : `${displayedResults.length} Angebot${displayedResults.length !== 1 ? 'e' : ''} gefunden`}
+                    {stadtteil && ` in ${stadtteil}`}
                   </p>
                   <button className="link-btn" onClick={handleReset}>← Neue Suche</button>
                 </div>
 
-                {results.length > 0 && (
+                {displayedResults.length > 0 && (
                   <div className="results-grid">
-                    {results.map((item, idx) => (
+                    {displayedResults.map((item, idx) => (
                       <ResultCard
                         key={item.id}
                         item={item}
@@ -211,7 +343,7 @@ export default function App() {
 
         {/* ── Rechte Spalte: Karte ── */}
         <div className="right-panel">
-          <MapPanel results={results} onUpdate={handleTravelUpdate} />
+          <MapPanel results={displayedResults} onUpdate={handleTravelUpdate} />
         </div>
       </div>
 

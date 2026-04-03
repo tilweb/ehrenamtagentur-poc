@@ -49,7 +49,139 @@ export async function loadData() {
   ])
 
   const offersMap = new Map(offers.map(o => [o.id, o]))
-  return { index, offersMap, embeddings }
+  const stadtteilIndex = buildStadtteilIndex(offersMap)
+  return { index, offersMap, embeddings, stadtteilIndex }
+}
+
+// ── Stadtteil-Erkennung ────────────────────────────────────────
+
+// Erweiterte Normalisierung für Stadtteil-Matching:
+// "Rüttenscheid", "rüttenscheid", "ruettenscheid" → "ruttenscheid"
+function normalizeDistrict(str) {
+  return str
+    .toLowerCase()
+    .replace(/ue/g, 'u')
+    .replace(/oe/g, 'o')
+    .replace(/ae/g, 'a')
+    .replace(/ü/g, 'u')
+    .replace(/ö/g, 'o')
+    .replace(/ä/g, 'a')
+    .replace(/ß/g, 'ss')
+    .replace(/-/g, '')
+}
+
+// Baut Index aus allen stadtteile-Werten der Angebote.
+// Map<normalizedName, rawStadtteilValue[]>
+function buildStadtteilIndex(offersMap) {
+  const index = new Map()
+  const allRaw = new Set()
+
+  for (const offer of offersMap.values()) {
+    for (const st of offer.stadtteile || []) {
+      allRaw.add(st)
+    }
+  }
+
+  for (const raw of allRaw) {
+    if (raw === '1 Ortsunabhängig') continue
+    // "Rüttenscheid - E" → "Rüttenscheid"
+    const name = raw.replace(/\s*-\s*(E|DU)$/, '').trim()
+    if (!name) continue
+
+    const key = normalizeDistrict(name)
+    if (!index.has(key)) index.set(key, [])
+    index.get(key).push(raw)
+
+    // Für Bindestrich-Stadtteile auch den ersten Teil indexieren:
+    // "Überruhr-Hinsel" → "überruhr" findet beide Überruhr-Varianten
+    if (name.includes('-')) {
+      const prefix = normalizeDistrict(name.split('-')[0])
+      if (!index.has(prefix)) index.set(prefix, [])
+      if (!index.get(prefix).includes(raw)) index.get(prefix).push(raw)
+    }
+  }
+
+  return index
+}
+
+// Lokative Präpositionen, die einen ambigen Stadtteil-Namen eindeutig machen
+const LOCATIVE_PREPS = new Set(['in', 'aus', 'bei', 'nach', 'um', 'nahe'])
+const AMBIGUOUS_NAMES = new Set(['werden', 'horst'])
+
+// Extrahiert einen Stadtteil aus der Query und gibt die bereinigte Query zurück.
+function extractStadtteil(query, stadtteilIndex) {
+  const tokens = query.split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) return { cleanQuery: query, matchedStadtteile: null, displayName: null }
+
+  // Probiere Token-Subsequenzen, längste zuerst (max 3 Wörter)
+  for (let len = Math.min(3, tokens.length); len >= 1; len--) {
+    for (let start = 0; start <= tokens.length - len; start++) {
+      const slice = tokens.slice(start, start + len)
+      const candidate = normalizeDistrict(slice.join(''))
+      const match = stadtteilIndex.get(candidate)
+
+      if (match) {
+        // Ambige Namen nur mit Präposition oder als einziges Wort akzeptieren
+        if (AMBIGUOUS_NAMES.has(candidate) && tokens.length > 1) {
+          const prevToken = start > 0 ? tokens[start - 1].toLowerCase() : ''
+          if (!LOCATIVE_PREPS.has(prevToken)) continue
+        }
+
+        // Präposition mit entfernen ("in Steele" → cleanQuery ohne "in" und "Steele")
+        let removeStart = start
+        if (start > 0 && LOCATIVE_PREPS.has(tokens[start - 1].toLowerCase())) {
+          removeStart = start - 1
+        }
+
+        const remaining = [...tokens.slice(0, removeStart), ...tokens.slice(start + len)]
+        const displayName = slice.join(' ')
+
+        return {
+          cleanQuery: remaining.join(' ').trim(),
+          matchedStadtteile: match,
+          displayName,
+        }
+      }
+    }
+  }
+
+  return { cleanQuery: query, matchedStadtteile: null, displayName: null }
+}
+
+// Filtert Kandidaten auf die, die im erkannten Stadtteil liegen.
+function applyStadtteilFilter(candidates, matchedStadtteile) {
+  return candidates.filter(offer => {
+    const st = offer.stadtteile || []
+    if (st.length === 0) return true
+    if (st.includes('1 Ortsunabhängig')) return true
+    return matchedStadtteile.some(m => st.includes(m))
+  })
+}
+
+// ── Filterwerte aus den Daten extrahieren ─────────────────────
+
+export function getFilterOptions(data) {
+  const { offersMap } = data
+  const categories = new Set()
+  const stadtteile = new Set()
+  const targets = new Set()
+
+  for (const offer of offersMap.values()) {
+    ;(offer.categories || []).forEach(c => categories.add(c))
+    ;(offer.stadtteile || []).forEach(s => { if (s !== '1 Ortsunabhängig') stadtteile.add(s) })
+    ;(offer.targets || []).forEach(t => targets.add(t))
+  }
+
+  const coll = new Intl.Collator('de')
+  return {
+    categories: [...categories].sort(coll.compare),
+    stadtteile: [...stadtteile].sort(coll.compare),
+    targets: [...targets].sort(coll.compare),
+  }
+}
+
+export function formatStadtteil(raw) {
+  return raw.replace(/\s*-\s*(E|DU)$/, '').trim()
 }
 
 // ── Hilfsfunktionen ────────────────────────────────────────────
@@ -227,10 +359,14 @@ async function filterRelevant(query, offers) {
 // ── Hauptfunktion ──────────────────────────────────────────────
 
 export async function semanticSearch(query, data) {
-  const { index, offersMap, embeddings } = data
+  const { index, offersMap, embeddings, stadtteilIndex } = data
+
+  // Stadtteil aus Query extrahieren und bereinigen
+  const { cleanQuery, matchedStadtteile, displayName } = extractStadtteil(query, stadtteilIndex)
+  const searchQuery = cleanQuery || query // Fallback falls nur Stadtteil eingegeben wurde
 
   // Query-Expansion (LLM): „Fahrrad" → [„Fahrrad", „Mountainbike", „Rad", …]
-  const expandedTerms = await expandQuery(query)
+  const expandedTerms = await expandQuery(searchQuery)
 
   // Stufe 1a+b parallel: Embedding auf expanded query + Textsuche auf allen Termen
   const [rawQueryVec, textHits] = await Promise.all([
@@ -268,15 +404,56 @@ export async function semanticSearch(query, data) {
     if (!seenIds.has(id)) { seenIds.add(id); candidates.push(id) }
   }
 
+  // Stufe 1c: Wenn Stadtteil erkannt, ortsspezifische Angebote als dritte Quelle
+  // (Angebote die wirklich dort sind, nicht nur stadtweite mit 50 Stadtteilen)
+  if (matchedStadtteile) {
+    for (const [id, offer] of offersMap) {
+      if (seenIds.has(id)) continue
+      const st = offer.stadtteile || []
+      if (st.length > 0 && st.length <= 10 && matchedStadtteile.some(m => st.includes(m))) {
+        seenIds.add(id)
+        candidates.push(id)
+      }
+    }
+  }
+
   const candidateOffers = candidates
     .slice(0, MAX_CANDIDATES)
     .map(id => offersMap.get(id))
     .filter(Boolean)
 
-  if (candidateOffers.length === 0) return []
+  if (candidateOffers.length === 0) {
+    return { results: [], stadtteil: displayName, stadtteilFilterApplied: false }
+  }
+
+  // Stadtteil-Filter anwenden (vor LLM-Filter, spart Tokens)
+  let filteredCandidates = candidateOffers
+  let stadtteilFilterApplied = false
+  if (matchedStadtteile) {
+    const filtered = applyStadtteilFilter(candidateOffers, matchedStadtteile)
+    if (filtered.length > 0) {
+      // Nach Spezifität sortieren: Angebote mit weniger Stadtteilen zuerst
+      // (= tatsächlich dort, nicht stadtweite Angebote die überall gelistet sind)
+      filtered.sort((a, b) => (a.stadtteile?.length || 999) - (b.stadtteile?.length || 999))
+      filteredCandidates = filtered
+      stadtteilFilterApplied = true
+    }
+    // Bei 0 Treffern: Fallback auf alle Kandidaten
+  }
 
   // Stufe 2: LLM filtert Relevanz
-  const relevant = await filterRelevant(query, candidateOffers)
+  // Bei generischer Query + Stadtteil-Filter (z.B. "etwas in Rüttenscheid")
+  // → LLM-Filter überspringen, da der Stadtteil das eigentliche Filterkriterium ist
+  const isGenericQuery = searchQuery.split(/\s+/).filter(t => t.length > 3).length === 0
+  if (stadtteilFilterApplied && isGenericQuery) {
+    return { results: filteredCandidates, stadtteil: displayName, stadtteilFilterApplied }
+  }
 
-  return candidateOffers.filter((_, i) => relevant[i] !== false)
+  const relevant = await filterRelevant(searchQuery, filteredCandidates)
+
+  return {
+    results: filteredCandidates.filter((_, i) => relevant[i] !== false),
+    stadtteil: displayName,
+    stadtteilFilterApplied,
+  }
 }
